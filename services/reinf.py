@@ -1,0 +1,143 @@
+import pandas as pd
+from utils.cpf import limpar_cpf, validar_cpf
+from utils.datas import validar_data
+from services.higienizacao import higienizar_texto_nome
+
+SINONIMOS_REINF_R4010 = {
+    'cpf': ['cpf', 'cpf_residente', 'n° cpf', 'num_cpf', 'cpf do residente', 'cpf residente'],
+    'data_fato_gerador': ['data_fato_gerador', 'data fato gerador', 'fato gerador', 'data ob', 'data_ob', 'data crédito em conta', 'data credito', 'data_credito', 'data_pagamento', 'data pagamento', 'dt_pgto', 'data', 'data de pagamento'],
+    'rendimento_bruto': ['rendimento_bruto', 'rendimento bruto', 'total_bruto', 'valor bruto', 'valor líquido', 'valor liquido', 'bolsa', 'bruto', 'valor recebido', 'valor atualizado (r$)', 'valor líquido (r$)'],
+    'parcela_isenta': ['parcela_isenta', 'parcela isenta', 'isento', 'valor_isento', 'valor isento', 'rendimento_isento', 'rendimento isento'],
+    'observacao_pagamento': ['observacao_pagamento', 'observacao pagamento', 'observacao', 'observação', 'obs', 'tipo residência', 'tipo residencia', 'competência', 'competencia', 'ordem bancária', 'ordem bancaria', 'protocolo singular', 'ordenação de despesa']
+}
+
+def auto_detectar_mapeamento_reinf(colunas_entrada: list[str]) -> tuple[dict, list[str]]:
+    """
+    Associa automaticamente as colunas da planilha de entrada aos campos do EFD-Reinf R-4010.
+    """
+    col_map = {
+        'cpf': None,
+        'data_fato_gerador': None,
+        'rendimento_bruto': None,
+        'parcela_isenta': None,
+        'observacao_pagamento': None
+    }
+    
+    colunas_norm = {col: str(col).strip().lower() for col in colunas_entrada}
+    colunas_usadas = set()
+    
+    # 1. Busca por correspondência exata ou sinônimos
+    for campo_reinf, sinonimos in SINONIMOS_REINF_R4010.items():
+        for col_orig, norm_orig in colunas_norm.items():
+            if norm_orig in sinonimos and col_orig not in colunas_usadas:
+                col_map[campo_reinf] = col_orig
+                colunas_usadas.add(col_orig)
+                break
+                
+    # 2. Busca por sub-strings para campos não encontrados
+    for campo_reinf, sinonimos in SINONIMOS_REINF_R4010.items():
+        if col_map[campo_reinf] is None:
+            for col_orig, norm_orig in colunas_norm.items():
+                if col_orig not in colunas_usadas:
+                    if any(sin in norm_orig for sin in sinonimos):
+                        col_map[campo_reinf] = col_orig
+                        colunas_usadas.add(col_orig)
+                        break
+                        
+    colunas_nao_mapeadas = [c for c in colunas_entrada if c not in colunas_usadas]
+    return col_map, colunas_nao_mapeadas
+
+def validar_base_reinf(df: pd.DataFrame, col_map: dict) -> list[dict]:
+    """
+    Executa a validação linha a linha para a base EFD-Reinf R-4010.
+    """
+    col_cpf = col_map.get('cpf')
+    col_dt_fg = col_map.get('data_fato_gerador')
+    col_bruto = col_map.get('rendimento_bruto')
+    col_isento = col_map.get('parcela_isenta')
+    col_obs = col_map.get('observacao_pagamento')
+    
+    cpfs = []
+    if col_cpf and col_cpf in df.columns:
+        for idx, row in df.iterrows():
+            c = limpar_cpf(row.get(col_cpf, ""))
+            cpfs.append(c)
+                
+    resultados = []
+    for idx, row in df.iterrows():
+        linha_excel = idx + 2
+        
+        cpf_val = limpar_cpf(row.get(col_cpf, "")) if col_cpf else ""
+        dt_fg_val = str(row.get(col_dt_fg, "")).strip() if col_dt_fg and pd.notna(row.get(col_dt_fg)) else ""
+        bruto_val = str(row.get(col_bruto, "0.00")).strip() if col_bruto and pd.notna(row.get(col_bruto)) else "0.00"
+        isento_val = str(row.get(col_isento, "0.00")).strip() if col_isento and pd.notna(row.get(col_isento)) else "0.00"
+        obs_val = str(row.get(col_obs, "")).strip() if col_obs and pd.notna(row.get(col_obs)) else ""
+        
+        nome_val = str(row.get('Nome', row.get('nome', ''))).strip() if pd.notna(row.get('Nome', row.get('nome', ''))) else ""
+
+        try:
+            b_float = float(bruto_val)
+        except ValueError:
+            b_float = 0.0
+            bruto_val = "0.00"
+
+        try:
+            i_float = float(isento_val)
+        except ValueError:
+            i_float = 0.0
+            isento_val = "0.00"
+
+        erros_criticos = []
+        alertas_amarelos = []
+        
+        # 1. Validação do CPF
+        if not cpf_val:
+            erros_criticos.append("CPF vazio")
+        else:
+            is_valid, msg_cpf = validar_cpf(cpf_val)
+            if not is_valid:
+                erros_criticos.append(f"CPF inválido: {msg_cpf}")
+                
+        # 2. Validação da Data do Fato Gerador
+        if not dt_fg_val:
+            erros_criticos.append("Data do Fato Gerador é obrigatória e está vazia")
+        else:
+            is_dt_valid, msg_dt = validar_data(dt_fg_val)
+            if not is_dt_valid:
+                erros_criticos.append(f"Data do fato gerador inválida: {msg_dt}")
+                
+        status = "🔴 ERRO_CRITICO" if erros_criticos else "🟢 OK"
+            
+        resultados.append({
+            'linha': linha_excel,
+            'cpf': cpf_val,
+            'nome': nome_val,
+            'data_fato_gerador': dt_fg_val,
+            'rendimento_bruto': f"{b_float:.2f}",
+            'parcela_isenta': f"{i_float:.2f}",
+            'observacao_pagamento': obs_val,
+            'status': status,
+            'erros_criticos': erros_criticos,
+            'alertas': alertas_amarelos
+        })
+        
+    return resultados
+
+def gerar_dataframe_reinf_final(registros: list[dict]) -> pd.DataFrame:
+    """
+    Converte os registros liberados do Reinf R-4010 no DataFrame final.
+    Colunas: ['cpf', 'data_fato_gerador', 'rendimento_bruto', 'parcela_isenta', 'observacao_pagamento']
+    """
+    colunas_modelo = ['cpf', 'data_fato_gerador', 'rendimento_bruto', 'parcela_isenta', 'observacao_pagamento']
+    
+    linhas_finais = []
+    for reg in registros:
+        linhas_finais.append({
+            'cpf': reg.get('cpf', ''),
+            'data_fato_gerador': reg.get('data_fato_gerador', ''),
+            'rendimento_bruto': reg.get('rendimento_bruto', '0.00'),
+            'parcela_isenta': reg.get('parcela_isenta', '0.00'),
+            'observacao_pagamento': reg.get('observacao_pagamento', '')
+        })
+        
+    return pd.DataFrame(linhas_finais, columns=colunas_modelo)

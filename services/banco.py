@@ -306,9 +306,97 @@ def atualizar_registro_banco(registro_id: int, novo_cpf: str, novo_nome: str, no
     finally:
         conn.close()
 
-def consolidar_folha_suplementar_sqlite(session_id: str, aba: str, opcao_inss: str = "bruto_igual_liquido", percentual_inss: float = 0.0, cbo_padrao: str = ""):
+def contar_divergencias_pendentes_banco(session_id: str, aba: str) -> int:
     """
-    Agrupa lançamentos por CPF e aplica regras de valores e CBO:
+    Conta quantos registros ainda pendentes (não aprovados manualmente) possuem
+    divergência identificada em relação à folha do mês anterior (Nome e/ou Data
+    de Nascimento diferentes).
+    """
+    init_db()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT COUNT(*) as qtd FROM registros_folha
+        WHERE session_id = ? AND aba = ? AND historico_json IS NOT NULL
+              AND aprovado_usuario = 0 AND status IN ('🟡 CONFERIR', '🔴 ERRO_CRITICO')
+        """, (session_id, aba))
+        row = cur.fetchone()
+        return row['qtd'] or 0
+    finally:
+        conn.close()
+
+def aplicar_correcoes_folha_anterior_banco(session_id: str, aba: str) -> int:
+    """
+    Aplica em lote, para todos os registros pendentes desta aba com divergência
+    identificada, o Nome e a Data de Nascimento vindos da folha do mês anterior
+    (já conferida). Revalida cada registro e libera automaticamente os que não
+    tiverem mais nenhuma pendência. Retorna a quantidade de registros atualizados.
+    """
+    init_db()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT * FROM registros_folha
+        WHERE session_id = ? AND aba = ? AND historico_json IS NOT NULL
+              AND aprovado_usuario = 0 AND status IN ('🟡 CONFERIR', '🔴 ERRO_CRITICO')
+        """, (session_id, aba))
+        candidatos = cur.fetchall()
+
+        qtd = 0
+        for atual in candidatos:
+            hist = json.loads(atual['historico_json'])
+            nome_ant = hist.get('nome_anterior', '') or ''
+            dt_ant = hist.get('data_nascimento_anterior', '') or ''
+
+            nome_final = higienizar_texto_nome(nome_ant) if nome_ant else atual['nome']
+            dt_final = dt_ant if dt_ant else atual['data_nascimento']
+
+            erros = []
+            cpf_clean = atual['cpf']
+            if not cpf_clean:
+                erros.append("CPF vazio")
+            else:
+                is_valid, msg = validar_cpf(cpf_clean)
+                if not is_valid:
+                    erros.append(f"CPF inválido: {msg}")
+
+            if not nome_final:
+                erros.append("Nome é obrigatório e está vazio")
+
+            if not dt_final:
+                erros.append("Data de nascimento é obrigatória e está vazia")
+            else:
+                is_dt, msg_dt = validar_data(dt_final)
+                if not is_dt:
+                    erros.append(f"Data de nascimento inválida: {msg_dt}")
+
+            status = "🔴 ERRO_CRITICO" if erros else "🟢 CONFERIDO"
+
+            cur.execute("""
+            UPDATE registros_folha
+            SET nome = ?, data_nascimento = ?, status = ?, erros_json = ?, alertas_json = '[]',
+                aprovado_usuario = 1, historico_json = NULL
+            WHERE id = ?
+            """, (nome_final, dt_final, status, json.dumps(erros, ensure_ascii=False), atual['id']))
+            qtd += 1
+
+        conn.commit()
+        return qtd
+    finally:
+        conn.close()
+
+def consolidar_folha_suplementar_sqlite(session_id: str, aba: str, aplicar_regra_valores: bool = False, opcao_inss: str = "bruto_igual_liquido", percentual_inss: float = 0.0, cbo_padrao: str = ""):
+    """
+    Agrupa lançamentos duplicados do mesmo CPF em uma única linha (resolve o erro de
+    "CPF duplicado") somando os valores de Bruto/Líquido/INSS dos lançamentos agrupados.
+
+    Por padrão (aplicar_regra_valores=False) os valores somados são mantidos exatamente
+    como vieram da planilha original — nada é recalculado. Isso é o esperado quando a
+    planilha já chega com Bruto/Líquido/INSS corretos e só é preciso juntar os lançamentos.
+
+    Se aplicar_regra_valores=True, os valores agregados são recalculados conforme:
     - 'bruto_igual_liquido': Define Valor Bruto = Valor Líquido (INSS = 0)
     - 'gross_up_inss': Calcula o Valor Bruto a partir do Líquido aplicando Gross Up:
        Bruto = Líquido / (1 - %INSS) e INSS = Bruto - Líquido.
@@ -319,7 +407,8 @@ def consolidar_folha_suplementar_sqlite(session_id: str, aba: str, opcao_inss: s
         cur = conn.cursor()
         
         cur.execute("""
-        SELECT cpf, nome, data_nascimento, cbo,
+        SELECT cpf, nome, data_nascimento,
+               MAX(NULLIF(TRIM(cbo), '')) as cbo,
                SUM(total_bruto) as soma_bruto,
                SUM(total_liquido) as soma_liquido,
                SUM(inss) as soma_inss,
@@ -343,29 +432,35 @@ def consolidar_folha_suplementar_sqlite(session_id: str, aba: str, opcao_inss: s
             liquido_orig = float(g['soma_liquido'] or 0)
             inss_orig = float(g['soma_inss'] or 0)
             
-            val_liquido_base = liquido_orig if liquido_orig > 0 else bruto_orig
-            
-            if opcao_inss in ('gross_up_inss', 'percentual_inss') and percentual_inss > 0:
-                p_dec = percentual_inss / 100.0
-                if p_dec < 1.0:
-                    bruto_calc = round(val_liquido_base / (1.0 - p_dec), 2)
-                    inss_calc = round(bruto_calc - val_liquido_base, 2)
-                    liquido_calc = val_liquido_base
-                else:
+            if aplicar_regra_valores:
+                val_liquido_base = liquido_orig if liquido_orig > 0 else bruto_orig
+                if opcao_inss in ('gross_up_inss', 'percentual_inss') and percentual_inss > 0:
+                    p_dec = percentual_inss / 100.0
+                    if p_dec < 1.0:
+                        bruto_calc = round(val_liquido_base / (1.0 - p_dec), 2)
+                        inss_calc = round(bruto_calc - val_liquido_base, 2)
+                        liquido_calc = val_liquido_base
+                    else:
+                        bruto_calc = val_liquido_base
+                        inss_calc = 0.0
+                        liquido_calc = val_liquido_base
+                else: # bruto_igual_liquido
                     bruto_calc = val_liquido_base
                     inss_calc = 0.0
                     liquido_calc = val_liquido_base
-            else: # default: bruto_igual_liquido
-                bruto_calc = val_liquido_base
-                inss_calc = 0.0
-                liquido_calc = val_liquido_base
+            else:
+                # Mantém os valores originais da planilha: apenas soma os lançamentos do mesmo CPF.
+                bruto_calc = round(bruto_orig, 2)
+                liquido_calc = round(liquido_orig if liquido_orig > 0 else bruto_orig, 2)
+                inss_calc = round(inss_orig, 2)
 
             cpf_val = g['cpf']
             nome_val = g['nome']
             dt_val = g['data_nascimento']
-            
-            # CBO: Se fornecido cbo_padrao no painel, usa ele; senão usa o cbo da linha ou 225125 como padrão
-            cbo_val = str(cbo_padrao).strip() if str(cbo_padrao).strip() else (str(g['cbo'] or "").strip() or "225125")
+
+            # CBO: preserva o CBO já preenchido na planilha; o padrão informado no painel
+            # (ou o fallback "225125") só é usado quando a linha não tem CBO nenhum.
+            cbo_val = str(g['cbo'] or "").strip() or str(cbo_padrao).strip() or "225125"
             
             erros = []
             is_v, msg_c = validar_cpf(cpf_val)

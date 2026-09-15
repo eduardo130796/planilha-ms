@@ -63,6 +63,17 @@ TIPOS_PLANILHA_REINF = {
         "parcela_isenta_igual_bruto": True,
         "separar_por_competencia": True,
     },
+    "🏨 Ajuda de Custos - Acolhimento": {
+        "descricao": "Pagamentos de ajuda de custos de acolhimento (ex.: PMMB). O valor pago é 100% isento (usado como rendimento bruto e como parcela isenta) e os lançamentos são separados automaticamente por competência a partir da Data da OB.",
+        "mapeamento_prioritario": {
+            "cpf": ["CPF"],
+            "data_fato_gerador": ["Data OB", "Data da OB", "Data Ordem Bancária"],
+            "rendimento_bruto": ["Valor Líquido", "Valor"],
+            "observacao_pagamento": ["DATAS E LOCAL DO ACOLHIMENTO", "Datas e Local do Acolhimento"],
+        },
+        "parcela_isenta_igual_bruto": True,
+        "separar_por_competencia": True,
+    },
     "➕ Outro / Genérico": {
         "descricao": "Planilha sem modelo específico — usa a detecção automática padrão de colunas. Cada aba do arquivo é tratada como uma competência.",
         "mapeamento_prioritario": None,
@@ -779,11 +790,10 @@ def carregar_e_salvar_reinf_aba_no_banco(aba_nome, file_bytes):
     salvar_registros_reinf_no_banco(session_id, aba_nome, registros)
     st.session_state['abas_processadas_reinf_db'].add(aba_nome)
 
-def obter_competencias_reinf(aba_origem, file_bytes, config_tipo):
-    """Lê e mapeia a aba de origem (planilha "achatada" com vários meses misturados) e
-    devolve os registros já validados, agrupados por competência (AAAA-MM) derivada da
-    Data do Fato Gerador — sem gravar nada no banco ainda."""
-    df_raw = carregar_dados_aba_cached(file_bytes, aba_origem)
+def mapear_colunas_reinf(df_raw, config_tipo):
+    """Mapeia as colunas de um DataFrame já lido conforme o tipo de planilha escolhido
+    (mapeamento explícito, com fallback para a detecção automática genérica), aplicando
+    a regra de parcela isenta = rendimento bruto quando o tipo assim define."""
     mapeamento_prioritario = config_tipo.get('mapeamento_prioritario')
     if mapeamento_prioritario:
         col_map, _ = mapear_colunas_com_prioridade(list(df_raw.columns), mapeamento_prioritario)
@@ -793,6 +803,33 @@ def obter_competencias_reinf(aba_origem, file_bytes, config_tipo):
     if config_tipo.get('parcela_isenta_igual_bruto') and not col_map.get('parcela_isenta') and col_map.get('rendimento_bruto'):
         col_map['parcela_isenta'] = col_map['rendimento_bruto']
 
+    return col_map
+
+def escolher_melhor_aba_origem(file_bytes, abas_fisicas, config_tipo):
+    """Quando a planilha tem mais de uma aba física, sugere como padrão a que realmente
+    parece conter os lançamentos (mais colunas reconhecidas), em vez de simplesmente
+    pegar a primeira — evitando cair, por exemplo, numa aba de resumo/tabela dinâmica
+    que o Excel deixou junto (como 'Planilha1' antes da aba de dados de verdade)."""
+    melhor_aba = abas_fisicas[0]
+    melhor_pontuacao = -1
+    for aba in abas_fisicas:
+        try:
+            df_raw = carregar_dados_aba_cached(file_bytes, aba)
+            col_map = mapear_colunas_reinf(df_raw, config_tipo)
+        except Exception:
+            continue
+        pontuacao = sum(1 for campo in ('cpf', 'data_fato_gerador', 'rendimento_bruto', 'observacao_pagamento') if col_map.get(campo))
+        if pontuacao > melhor_pontuacao:
+            melhor_pontuacao = pontuacao
+            melhor_aba = aba
+    return melhor_aba
+
+def obter_competencias_reinf(aba_origem, file_bytes, config_tipo):
+    """Lê e mapeia a aba de origem (planilha "achatada" com vários meses misturados) e
+    devolve os registros já validados, agrupados por competência (AAAA-MM) derivada da
+    Data do Fato Gerador — sem gravar nada no banco ainda."""
+    df_raw = carregar_dados_aba_cached(file_bytes, aba_origem)
+    col_map = mapear_colunas_reinf(df_raw, config_tipo)
     registros = validar_base_reinf(df_raw, col_map)
     return dividir_registros_por_competencia(registros)
 
@@ -999,11 +1036,13 @@ else:
             if len(abas_fisicas) == 1:
                 aba_origem = abas_fisicas[0]
             else:
+                aba_sugerida = escolher_melhor_aba_origem(file_bytes, abas_fisicas, config_tipo_reinf)
                 aba_origem = st.selectbox(
                     "📂 **Qual aba contém os lançamentos a separar por competência?**",
                     options=abas_fisicas,
-                    index=0,
-                    key="seletor_aba_reinf_origem"
+                    index=abas_fisicas.index(aba_sugerida),
+                    key="seletor_aba_reinf_origem",
+                    help="Sugerimos automaticamente a aba que parece ter os dados reais (mais colunas reconhecidas). Troque se não for a certa."
                 )
             grupos_competencia = obter_competencias_reinf(aba_origem, file_bytes, config_tipo_reinf)
             carregar_e_salvar_competencias_reinf(grupos_competencia)

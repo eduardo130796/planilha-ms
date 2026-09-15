@@ -1,7 +1,7 @@
 from datetime import datetime
 import pandas as pd
 from utils.cpf import limpar_cpf, validar_cpf
-from utils.datas import validar_data
+from utils.datas import validar_data, normalizar_data
 from services.higienizacao import higienizar_texto_nome
 
 SINONIMOS_REINF_R4010 = {
@@ -106,7 +106,7 @@ def validar_base_reinf(df: pd.DataFrame, col_map: dict) -> list[dict]:
         linha_excel = idx + 2
         
         cpf_val = limpar_cpf(row.get(col_cpf, "")) if col_cpf else ""
-        dt_fg_val = str(row.get(col_dt_fg, "")).strip() if col_dt_fg and pd.notna(row.get(col_dt_fg)) else ""
+        dt_fg_val = normalizar_data(row.get(col_dt_fg, "")) if col_dt_fg and pd.notna(row.get(col_dt_fg)) else ""
         bruto_val = str(row.get(col_bruto, "0.00")).strip() if col_bruto and pd.notna(row.get(col_bruto)) else "0.00"
         isento_val = str(row.get(col_isento, "0.00")).strip() if col_isento and pd.notna(row.get(col_isento)) else "0.00"
         obs_val = str(row.get(col_obs, "")).strip() if col_obs and pd.notna(row.get(col_obs)) else ""

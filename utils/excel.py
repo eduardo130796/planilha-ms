@@ -88,12 +88,19 @@ def ler_aba_excel(file_input, aba_nome: str = None) -> pd.DataFrame:
 def gerar_excel_esocial(df_esocial: pd.DataFrame, modelo_path: str = "templates/esocial.xlsx") -> bytes:
     """
     Gera o arquivo Excel formatado rigorosamente conforme o modelo usando o escritor
-    streaming write_only de alta velocidade do OpenPyXL.
+    streaming write_only de alta velocidade do OpenPyXL. O nome da aba vem do próprio
+    modelo de referência (esocial.xlsx -> "E-Social", reinf_r4010.xlsx -> "R-4010") e a
+    ordem/nome das colunas vem do DataFrame já formatado pela função geradora específica
+    (gerar_dataframe_esocial_final / gerar_dataframe_reinf_final).
     """
+    wb_modelo = openpyxl.load_workbook(modelo_path, read_only=True)
+    titulo_aba = wb_modelo.sheetnames[0]
+    wb_modelo.close()
+
     wb = openpyxl.Workbook(write_only=True)
-    ws = wb.create_sheet(title="E-Social")
-    
-    colunas_modelo = ['cpf', 'nome', 'data_nascimento', 'total_bruto', 'total_liquido', 'cbo', 'inss']
+    ws = wb.create_sheet(title=titulo_aba)
+
+    colunas_modelo = list(df_esocial.columns)
     ws.append(colunas_modelo)
     
     for r in df_esocial.itertuples(index=False):

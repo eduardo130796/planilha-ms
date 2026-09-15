@@ -1,3 +1,4 @@
+from datetime import datetime
 import pandas as pd
 from utils.cpf import limpar_cpf, validar_cpf
 from utils.datas import validar_data
@@ -5,10 +6,10 @@ from services.higienizacao import higienizar_texto_nome
 
 SINONIMOS_REINF_R4010 = {
     'cpf': ['cpf', 'cpf_residente', 'n° cpf', 'num_cpf', 'cpf do residente', 'cpf residente'],
-    'data_fato_gerador': ['data_fato_gerador', 'data fato gerador', 'fato gerador', 'data ob', 'data_ob', 'data crédito em conta', 'data credito', 'data_credito', 'data_pagamento', 'data pagamento', 'dt_pgto', 'data', 'data de pagamento'],
-    'rendimento_bruto': ['rendimento_bruto', 'rendimento bruto', 'total_bruto', 'valor bruto', 'valor líquido', 'valor liquido', 'bolsa', 'bruto', 'valor recebido', 'valor atualizado (r$)', 'valor líquido (r$)'],
+    'data_fato_gerador': ['data_fato_gerador', 'data fato gerador', 'fato gerador', 'data ob', 'data_ob', 'data da ob', 'data crédito em conta', 'data credito', 'data_credito', 'data_pagamento', 'data pagamento', 'dt_pgto', 'data', 'data de pagamento'],
+    'rendimento_bruto': ['rendimento_bruto', 'rendimento bruto', 'total_bruto', 'valor bruto', 'valor líquido', 'valor liquido', 'bolsa', 'bruto', 'valor recebido', 'valor atualizado (r$)', 'valor líquido (r$)', 'valor'],
     'parcela_isenta': ['parcela_isenta', 'parcela isenta', 'isento', 'valor_isento', 'valor isento', 'rendimento_isento', 'rendimento isento'],
-    'observacao_pagamento': ['observacao_pagamento', 'observacao pagamento', 'observacao', 'observação', 'obs', 'tipo residência', 'tipo residencia', 'competência', 'competencia', 'ordem bancária', 'ordem bancaria', 'protocolo singular', 'ordenação de despesa']
+    'observacao_pagamento': ['observacao_pagamento', 'observacao pagamento', 'observacao', 'observação', 'obs', 'tipo residência', 'tipo residencia', 'competência', 'competencia', 'ordem bancária', 'ordem bancaria', 'protocolo singular', 'ordenação de despesa', 'finalidade']
 }
 
 def auto_detectar_mapeamento_reinf(colunas_entrada: list[str]) -> tuple[dict, list[str]]:
@@ -44,6 +45,43 @@ def auto_detectar_mapeamento_reinf(colunas_entrada: list[str]) -> tuple[dict, li
                         colunas_usadas.add(col_orig)
                         break
                         
+    colunas_nao_mapeadas = [c for c in colunas_entrada if c not in colunas_usadas]
+    return col_map, colunas_nao_mapeadas
+
+def mapear_colunas_com_prioridade(colunas_entrada: list[str], mapeamento_prioritario: dict) -> tuple[dict, list[str]]:
+    """
+    Mapeia as colunas dando prioridade a nomes exatos conhecidos de um modelo específico
+    de planilha (ex.: Auxílio Moradia), e usa a detecção automática genérica como reforço
+    para os campos que não constarem no mapeamento prioritário — evitando ambiguidades
+    da lista genérica de sinônimos (ex.: 'Ordem Bancária' também é sinônimo genérico de
+    observação, mas não deve vencer 'Finalidade' num modelo que já define isso).
+    `mapeamento_prioritario` é da forma {'campo_saida': ['Nome Exato 1', 'Nome Exato 2']}.
+    """
+    colunas_norm = {col: str(col).strip().lower() for col in colunas_entrada}
+    col_map = {
+        'cpf': None,
+        'data_fato_gerador': None,
+        'rendimento_bruto': None,
+        'parcela_isenta': None,
+        'observacao_pagamento': None
+    }
+    colunas_usadas = set()
+
+    for campo, candidatos in mapeamento_prioritario.items():
+        candidatos_norm = [str(c).strip().lower() for c in candidatos]
+        for col_orig, norm_orig in colunas_norm.items():
+            if norm_orig in candidatos_norm and col_orig not in colunas_usadas:
+                col_map[campo] = col_orig
+                colunas_usadas.add(col_orig)
+                break
+
+    colunas_restantes = [c for c in colunas_entrada if c not in colunas_usadas]
+    col_map_auto, _ = auto_detectar_mapeamento_reinf(colunas_restantes)
+    for campo, valor in col_map_auto.items():
+        if col_map[campo] is None and valor is not None:
+            col_map[campo] = valor
+            colunas_usadas.add(valor)
+
     colunas_nao_mapeadas = [c for c in colunas_entrada if c not in colunas_usadas]
     return col_map, colunas_nao_mapeadas
 
@@ -122,6 +160,30 @@ def validar_base_reinf(df: pd.DataFrame, col_map: dict) -> list[dict]:
         })
         
     return resultados
+
+def calcular_competencia(data_fato_gerador: str) -> str:
+    """
+    Deriva a competência (AAAA-MM) a partir da Data do Fato Gerador (DD/MM/YYYY).
+    Registros sem data válida caem na competência 'SEM_DATA' para não serem perdidos.
+    """
+    try:
+        dt = datetime.strptime(str(data_fato_gerador).strip(), '%d/%m/%Y')
+        return dt.strftime('%Y-%m')
+    except (ValueError, TypeError):
+        return "SEM_DATA"
+
+def dividir_registros_por_competencia(registros: list[dict]) -> dict[str, list[dict]]:
+    """
+    Agrupa registros do EFD-Reinf já validados pela competência derivada da Data do
+    Fato Gerador. Útil quando a planilha de origem traz vários meses "achatados" em uma
+    única lista (ex.: auxílio-moradia), permitindo tratar cada competência como se fosse
+    uma aba independente no restante da conferência.
+    """
+    grupos: dict[str, list[dict]] = {}
+    for reg in registros:
+        competencia = calcular_competencia(reg.get('data_fato_gerador', ''))
+        grupos.setdefault(competencia, []).append(reg)
+    return grupos
 
 def gerar_dataframe_reinf_final(registros: list[dict]) -> pd.DataFrame:
     """

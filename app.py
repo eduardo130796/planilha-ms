@@ -8,7 +8,10 @@ from services.higienizacao import higienizar_dataframe
 from services.validacao import validar_base
 from services.comparacao import comparar_com_folha_anterior
 from services.conversao import auto_detectar_mapeamento, gerar_dataframe_esocial_final
-from services.reinf import auto_detectar_mapeamento_reinf, validar_base_reinf, gerar_dataframe_reinf_final
+from services.reinf import (
+    auto_detectar_mapeamento_reinf, mapear_colunas_com_prioridade, validar_base_reinf,
+    gerar_dataframe_reinf_final, dividir_registros_por_competencia
+)
 from services.exportacao import gerar_nome_arquivo, gerar_pacote_zip_arquivos, validar_arquivo_final_exportado
 from services.banco import (
     init_db, limpar_banco, salvar_registros_no_banco,
@@ -41,6 +44,30 @@ TIPOS_PLANILHA_ESOCIAL = {
     "➕ Outro / Genérico": {
         "cbo_padrao": "",
         "descricao": "Planilha sem modelo específico. Informe o CBO manualmente."
+    },
+}
+
+# Mesma ideia acima, mas para o módulo EFD-Reinf (R-4010): cada "tipo" pode fixar um
+# mapeamento de colunas conhecido (mapeamento_prioritario), marcar que o valor pago é
+# 100% isento (parcela_isenta_igual_bruto) e/ou que a planilha traz vários meses numa
+# lista só, precisando ser separada por competência a partir da Data do Fato Gerador.
+TIPOS_PLANILHA_REINF = {
+    "🏠 Auxílio Moradia": {
+        "descricao": "Pagamentos de auxílio-moradia. O valor pago é 100% isento (usado como rendimento bruto e como parcela isenta) e os lançamentos são separados automaticamente por competência a partir da Data da OB.",
+        "mapeamento_prioritario": {
+            "cpf": ["CPF"],
+            "data_fato_gerador": ["Data OB", "Data da OB", "Data Ordem Bancária"],
+            "rendimento_bruto": ["Valor"],
+            "observacao_pagamento": ["Finalidade"],
+        },
+        "parcela_isenta_igual_bruto": True,
+        "separar_por_competencia": True,
+    },
+    "➕ Outro / Genérico": {
+        "descricao": "Planilha sem modelo específico — usa a detecção automática padrão de colunas. Cada aba do arquivo é tratada como uma competência.",
+        "mapeamento_prioritario": None,
+        "parcela_isenta_igual_bruto": False,
+        "separar_por_competencia": False,
     },
 }
 
@@ -189,6 +216,8 @@ if 'arquivos_gerados_cache' not in st.session_state:
     st.session_state['arquivos_gerados_cache'] = {}
 if 'tipo_planilha_esocial' not in st.session_state:
     st.session_state['tipo_planilha_esocial'] = list(TIPOS_PLANILHA_ESOCIAL.keys())[0]
+if 'tipo_planilha_reinf' not in st.session_state:
+    st.session_state['tipo_planilha_reinf'] = list(TIPOS_PLANILHA_REINF.keys())[0]
 
 # -----------------------------------------------------------------------------
 # FUNÇÕES AUXILIARES DE UI
@@ -746,6 +775,33 @@ def carregar_e_salvar_reinf_aba_no_banco(aba_nome, file_bytes):
     salvar_registros_reinf_no_banco(session_id, aba_nome, registros)
     st.session_state['abas_processadas_reinf_db'].add(aba_nome)
 
+def obter_competencias_reinf(aba_origem, file_bytes, config_tipo):
+    """Lê e mapeia a aba de origem (planilha "achatada" com vários meses misturados) e
+    devolve os registros já validados, agrupados por competência (AAAA-MM) derivada da
+    Data do Fato Gerador — sem gravar nada no banco ainda."""
+    df_raw = carregar_dados_aba_cached(file_bytes, aba_origem)
+    mapeamento_prioritario = config_tipo.get('mapeamento_prioritario')
+    if mapeamento_prioritario:
+        col_map, _ = mapear_colunas_com_prioridade(list(df_raw.columns), mapeamento_prioritario)
+    else:
+        col_map, _ = auto_detectar_mapeamento_reinf(list(df_raw.columns))
+
+    if config_tipo.get('parcela_isenta_igual_bruto') and not col_map.get('parcela_isenta') and col_map.get('rendimento_bruto'):
+        col_map['parcela_isenta'] = col_map['rendimento_bruto']
+
+    registros = validar_base_reinf(df_raw, col_map)
+    return dividir_registros_por_competencia(registros)
+
+def carregar_e_salvar_competencias_reinf(grupos_por_competencia):
+    """Grava no banco apenas as competências ainda não processadas nesta sessão,
+    tratando cada competência como se fosse uma aba independente — assim, o restante da
+    tela de conferência do Reinf funciona sem nenhuma alteração."""
+    session_id = st.session_state['session_id']
+    for competencia, registros in grupos_por_competencia.items():
+        if competencia not in st.session_state['abas_processadas_reinf_db']:
+            salvar_registros_reinf_no_banco(session_id, competencia, registros)
+            st.session_state['abas_processadas_reinf_db'].add(competencia)
+
 # --- MENU LATERAL ---
 with st.sidebar:
     st.markdown('''
@@ -822,7 +878,26 @@ with st.sidebar:
         if st.session_state['folha_anterior_bytes'] is not None:
             st.badge(st.session_state['folha_anterior_nome'], icon="🔁", color="violet", width="stretch")
     else:
-        st.markdown('<div class="side-label">1 · Planilha EFD-Reinf</div>', unsafe_allow_html=True)
+        st.markdown('<div class="side-label">1 · Tipo de planilha</div>', unsafe_allow_html=True)
+        tipo_reinf = st.selectbox(
+            "Qual o modelo da planilha que você vai subir?",
+            options=list(TIPOS_PLANILHA_REINF.keys()),
+            index=list(TIPOS_PLANILHA_REINF.keys()).index(st.session_state['tipo_planilha_reinf']),
+            key="select_tipo_planilha_reinf",
+            label_visibility="collapsed",
+            help="Define o mapeamento de colunas esperado e se os lançamentos devem ser separados automaticamente por competência."
+        )
+        if tipo_reinf != st.session_state['tipo_planilha_reinf']:
+            # Tipo diferente pode mudar completamente o mapeamento de colunas e a forma
+            # de separar em abas/competências — reprocessa tudo do zero para não misturar
+            # dados interpretados com a configuração antiga.
+            st.session_state['abas_processadas_reinf_db'] = set()
+            st.session_state['arquivos_gerados_cache'] = {}
+            limpar_banco(st.session_state['session_id'])
+        st.session_state['tipo_planilha_reinf'] = tipo_reinf
+        st.caption(TIPOS_PLANILHA_REINF[tipo_reinf]["descricao"])
+
+        st.markdown('<div class="side-label">2 · Planilha EFD-Reinf</div>', unsafe_allow_html=True)
         arquivo_reinf = st.file_uploader("Upload do Arquivo R-4010 (.xlsx)", type=["xlsx"], key="file_reinf_atual", label_visibility="collapsed")
 
         if arquivo_reinf is not None:
@@ -904,34 +979,55 @@ else:
     else:
         file_bytes = st.session_state['reinf_bytes']
         session_id = st.session_state['session_id']
+        config_tipo_reinf = TIPOS_PLANILHA_REINF[st.session_state['tipo_planilha_reinf']]
+        separa_competencia = config_tipo_reinf.get('separar_por_competencia', False)
 
         analise_meta = analisar_arquivo_excel_rapido(file_bytes)
-        abas_disponiveis = analise_meta['abas_nomes']
 
         st.markdown(f'<span class="file-chip">📄 {st.session_state["reinf_nome"]}</span><span class="file-chip">📁 {analise_meta["total_abas"]} aba(s)</span>', unsafe_allow_html=True)
         st.write("")
 
-        if analise_meta['total_abas'] == 1:
+        if separa_competencia:
+            abas_fisicas = analise_meta['abas_nomes']
+            if len(abas_fisicas) == 1:
+                aba_origem = abas_fisicas[0]
+            else:
+                aba_origem = st.selectbox(
+                    "📂 **Qual aba contém os lançamentos a separar por competência?**",
+                    options=abas_fisicas,
+                    index=0,
+                    key="seletor_aba_reinf_origem"
+                )
+            grupos_competencia = obter_competencias_reinf(aba_origem, file_bytes, config_tipo_reinf)
+            carregar_e_salvar_competencias_reinf(grupos_competencia)
+            abas_disponiveis = sorted(grupos_competencia.keys())
+            st.caption(f"📆 {len(abas_disponiveis)} competência(s) identificada(s) automaticamente a partir da Data do Fato Gerador.")
+        else:
+            abas_disponiveis = analise_meta['abas_nomes']
+
+        rotulo_unidade = "competência" if separa_competencia else "aba"
+
+        if len(abas_disponiveis) == 1:
             aba_atual = abas_disponiveis[0]
             st.session_state['abas_selecionadas'] = [aba_atual]
         else:
             col_aba1, col_aba2 = st.columns([2, 1])
             with col_aba1:
                 aba_atual = st.selectbox(
-                    "📂 **Qual aba você deseja abrir?**",
+                    f"📂 **Qual {rotulo_unidade} você deseja abrir?**",
                     options=abas_disponiveis,
                     index=0,
                     key="seletor_aba_reinf_principal"
                 )
             with col_aba2:
-                exportar_todas = st.checkbox("📦 Processar e exportar TODAS as abas no final", value=True, key="chk_export_reinf_todas")
+                exportar_todas = st.checkbox(f"📦 Processar e exportar TODAS as {rotulo_unidade}s no final", value=True, key="chk_export_reinf_todas")
 
             if exportar_todas:
                 st.session_state['abas_selecionadas'] = abas_disponiveis
             else:
                 st.session_state['abas_selecionadas'] = [aba_atual]
 
-        if aba_atual not in st.session_state['abas_processadas_reinf_db']:
+        if not separa_competencia and aba_atual not in st.session_state['abas_processadas_reinf_db']:
             carregar_e_salvar_reinf_aba_no_banco(aba_atual, file_bytes)
 
         stats = obter_estatisticas_reinf_aba(session_id, aba_atual)
@@ -939,7 +1035,7 @@ else:
         step_idx = 1 if (stats['warn'] + stats['danger'] > 0) else (2 if aba_atual not in st.session_state['arquivos_gerados_cache'] else 3)
         render_stepper(STEPPER_REINF, current_index=step_idx)
 
-        st.markdown(f'<div class="section-title">🔎 Conferência da aba (REINF R-4010): {aba_atual}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title">🔎 Conferência da {rotulo_unidade} (REINF R-4010): {aba_atual}</div>', unsafe_allow_html=True)
         render_metric_cards(stats)
 
         st.write("")
@@ -1063,14 +1159,14 @@ else:
         st.write("")
 
         bloqueios_gerais = []
-        if aba_atual not in st.session_state['abas_processadas_reinf_db']:
+        if not separa_competencia and aba_atual not in st.session_state['abas_processadas_reinf_db']:
             carregar_e_salvar_reinf_aba_no_banco(aba_atual, file_bytes)
 
         st_aba = obter_estatisticas_reinf_aba(session_id, aba_atual)
         if st_aba['danger'] > 0:
-            bloqueios_gerais.append(f"Aba '{aba_atual}': {st_aba['danger']} erro(s) crítico(s)")
+            bloqueios_gerais.append(f"{rotulo_unidade.capitalize()} '{aba_atual}': {st_aba['danger']} erro(s) crítico(s)")
         if st_aba['warn'] > 0:
-            bloqueios_gerais.append(f"Aba '{aba_atual}': {st_aba['warn']} pendência(s) não analisada(s)")
+            bloqueios_gerais.append(f"{rotulo_unidade.capitalize()} '{aba_atual}': {st_aba['warn']} pendência(s) não analisada(s)")
 
         if bloqueios_gerais:
             st.error(f"🔒 **ARQUIVO DA ABA '{aba_atual}' BLOQUEADO** — Existem {st_aba['danger']} erro(s) e {st_aba['warn']} alerta(s) nesta aba.")

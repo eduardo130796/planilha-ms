@@ -379,8 +379,9 @@ def render_aplicar_lote_e_resultado(file_bytes, session_id, aba_atual, abas_disp
         return
 
     resumo_config = "agrupando os lançamentos duplicados por CPF" if agrupar_cpf else "sem agrupar por CPF"
-    st.markdown('<div class="section-title">📦 Aplicar esta configuração às outras competências</div>', unsafe_allow_html=True)
-    with st.container(border=True):
+    resumo_existente = st.session_state.get('resumo_lote_esocial')
+    ja_processado_deste_arquivo = bool(resumo_existente) and set(r['aba'] for r in resumo_existente) == set(abas_disponiveis)
+    with st.expander(f"📦 Planilha com {len(outras_abas)} outra(s) competência(s) — aplicar esta configuração a todas?", expanded=ja_processado_deste_arquivo):
         st.caption(f"Esta planilha tem mais {len(outras_abas)} aba(s) — provavelmente outras competências (meses). Você pode aplicar a mesma configuração usada em '{aba_atual}' ({resumo_config}) a todas elas de uma vez, comparando automaticamente cada competência com a anterior da própria planilha.")
 
         if st.button(f"Processar as {len(abas_disponiveis)} competências com esta configuração", icon="📦", type="primary", width="stretch", key=f"btn_aplicar_lote_{aba_atual}"):

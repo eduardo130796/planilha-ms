@@ -86,6 +86,30 @@ def limpar_banco(session_id: str = None):
     finally:
         conn.close()
 
+def limpar_sessoes_orfas(session_id_atual: str) -> int:
+    """
+    Remove do banco local todos os registros de sessões diferentes da sessão atual e
+    compacta o arquivo (VACUUM). Cada nova aba/janela do navegador gera um session_id
+    novo e nunca mais reaproveita o anterior, então dados de sessões passadas nunca
+    seriam lidos de novo — mantê-los só faz o banco (e o servidor) ficarem cada vez
+    mais pesados. Chamada automaticamente uma vez a cada nova sessão (ver app.py).
+    Retorna a quantidade de linhas removidas.
+    """
+    init_db()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM registros_folha WHERE session_id != ?", (session_id_atual,))
+        qtd = cur.rowcount
+        cur.execute("DELETE FROM registros_reinf_r4010 WHERE session_id != ?", (session_id_atual,))
+        qtd += cur.rowcount
+        conn.commit()
+        if qtd > 0:
+            conn.execute("VACUUM")
+        return qtd
+    finally:
+        conn.close()
+
 def salvar_registros_no_banco(session_id: str, aba: str, registros: list[dict]):
     init_db()
     conn = get_connection()

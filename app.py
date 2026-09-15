@@ -14,7 +14,7 @@ from services.reinf import (
 )
 from services.exportacao import gerar_nome_arquivo, gerar_pacote_zip_arquivos, validar_arquivo_final_exportado
 from services.banco import (
-    init_db, limpar_banco, salvar_registros_no_banco,
+    init_db, limpar_banco, limpar_sessoes_orfas, salvar_registros_no_banco,
     obter_estatisticas_aba, obter_registros_banco,
     atualizar_registro_banco, consolidar_folha_suplementar_sqlite,
     exportar_registros_banco_para_list, gerar_relatorio_inconsistencias_bytes,
@@ -194,6 +194,10 @@ init_db()
 # Session State
 if 'session_id' not in st.session_state:
     st.session_state['session_id'] = str(uuid.uuid4())
+    # Cada nova sessão (nova aba/janela do navegador) nunca reaproveita dados de sessões
+    # anteriores, então limpamos o que sobrou delas automaticamente para o banco local
+    # nunca ficar acumulando e pesando o servidor.
+    limpar_sessoes_orfas(st.session_state['session_id'])
 if 'folha_bytes' not in st.session_state:
     st.session_state['folha_bytes'] = None
 if 'folha_nome' not in st.session_state:
@@ -913,8 +917,11 @@ with st.sidebar:
     st.divider()
     if st.button("Limpar sessão / nova planilha", icon="🗑️", type="tertiary", width="stretch"):
         limpar_banco(st.session_state['session_id'])
+        st.cache_data.clear()  # libera da memória do servidor as planilhas já lidas/cacheadas
         st.session_state['folha_bytes'] = None
         st.session_state['folha_nome'] = None
+        st.session_state['folha_anterior_bytes'] = None
+        st.session_state['folha_anterior_nome'] = None
         st.session_state['reinf_bytes'] = None
         st.session_state['reinf_nome'] = None
         st.session_state['abas_processadas_db'] = set()

@@ -15,7 +15,7 @@ def analisar_arquivo_excel_rapido(file_bytes_ou_path) -> dict:
         'abas_nomes': abas_nomes
     }
 
-@st.cache_data(show_spinner="Carregando e processando aba do Excel...")
+@st.cache_data(show_spinner="Carregando e processando aba do Excel...", ttl="1h", max_entries=30)
 def carregar_dados_aba_cached(file_bytes_ou_path, aba_nome: str) -> pd.DataFrame:
     """
     Lê a aba do Excel com cache do Streamlit. Executa APENAS UMA VEZ por aba/arquivo,
